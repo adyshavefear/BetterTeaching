@@ -1,0 +1,273 @@
+import os
+import json
+import time
+import logging
+from typing import List, Optional
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from playwright.sync_api import sync_playwright
+
+# ----------------------------------------------------------------------
+# 1. CONFIGURAÇÕES E LOGS
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("lancamento_notas.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+load_dotenv()
+
+# ----------------------------------------------------------------------
+# 2. ESTRUTURA DO SCHEMA DE DADOS (3 NOTAS POR ALUNO)
+# ----------------------------------------------------------------------
+class NotasTriplasMapeadas(BaseModel):
+    id_aluno: str
+    nome_oficial: str
+    nota1: Optional[float] = None
+    nota2: Optional[float] = None
+    nota3: Optional[float] = None
+
+class ListaNotasMapeadas(BaseModel):
+    turma: str
+    alunos: List[NotasTriplasMapeadas]
+
+# ----------------------------------------------------------------------
+# 3. VALIDAÇÃO DE NOTAS
+# ----------------------------------------------------------------------
+def validar_e_formatar_nota(valor: Optional[float]) -> Optional[str]:
+    if valor is None:
+        return None
+    try:
+        nota_float = float(valor)
+        if not (0.0 <= nota_float <= 10.0):
+            logging.error(f"⚠️ Nota fora do intervalo permitido (0.0 - 10.0): {valor}")
+            return None
+        return f"{nota_float:.1f}".replace('.', ',')
+    except (ValueError, TypeError):
+        logging.error(f"⚠️ Valor de nota inválido: {valor}")
+        return None
+
+# ----------------------------------------------------------------------
+# 4. PROCESSAMENTO DE MÚLTIPLAS FOTOS VIA GEMINI
+# ----------------------------------------------------------------------
+def processar_cadernos_com_html(caminhos_imagens: List[str], alunos_site: list) -> dict:
+    client = genai.Client()
+
+    uploads_imagens = []
+    for cam in caminhos_imagens:
+        logging.info(f"📤 Fazendo upload da imagem '{cam}' para o Gemini...")
+        upload_obj = client.files.upload(file=cam)
+        uploads_imagens.append(upload_obj)
+
+    prompt = f"""
+    Você é um assistente especialista em lançamento de notas escolares.
+    
+    Abaixo está a lista oficial de alunos extraída diretamente do diário escolar no portal (HTML):
+    {json.dumps(alunos_site, ensure_ascii=False, indent=2)}
+
+    Sua tarefa:
+    1. Analise TODAS as imagens do caderno enviadas juntas e identifique os nomes dos alunos e os valores presentes nas colunas 'Nota 1', 'Nota 2' e 'Nota 3'.
+    2. Combine as informações das páginas se a lista de alunos continuar de uma imagem para a outra.
+    3. Faça a correspondência exata entre os alunos do caderno e os alunos da lista oficial (mesmo com variações de grafia ou abreviações).
+    4. Para cada aluno, extraia os valores numéricos de `nota1`, `nota2` e `nota3`. Se um aluno não tiver nota em alguma coluna, retorne null.
+    5. Retorne um JSON estrito contendo o `id_aluno` oficial, o `nome_oficial` exatamente como está na lista enviada e os campos `nota1`, `nota2` e `nota3`.
+    """
+
+    logging.info(f"🤖 Processando {len(uploads_imagens)} imagem(ns) e extraindo as 3 notas por aluno...")
+    
+    modelo = "gemini-3.8-flash"
+    max_tentativas = 5
+    
+    # Concatena os uploads das imagens junto com o prompt textual
+    conteudo_requisicao = uploads_imagens + [prompt]
+    
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            logging.info(f"Tentativa {tentativa}/{max_tentativas} com o modelo: {modelo}")
+            response = client.models.generate_content(
+                model=modelo,
+                contents=conteudo_requisicao,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ListaNotasMapeadas,
+                    tools=[]
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            logging.warning(f"⚠️ Tentativa {tentativa} com {modelo} falhou: {e}")
+            if ("503" in str(e) or "429" in str(e)) and tentativa < max_tentativas:
+                tempo_espera = tentativa * 7
+                logging.info(f"⏳ Servidor ocupado ou cota excedida. Aguardando {tempo_espera}s...")
+                time.sleep(tempo_espera)
+            elif tentativa == max_tentativas:
+                raise RuntimeError(f"❌ Não foi possível obter resposta do Gemini após {max_tentativas} tentativas. Erro: {e}")
+
+# ----------------------------------------------------------------------
+# 5. EXECUÇÃO DA AUTOMAÇÃO NO PLAYWRIGHT
+# ----------------------------------------------------------------------
+def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp("http://localhost:9222")
+        except Exception as e:
+            logging.error("❌ Não foi possível conectar ao navegador na porta 9222.")
+            logging.error("Certifique-se de ter iniciado o navegador com: --remote-debugging-port=9222")
+            return
+
+        context = browser.contexts[0]
+        page = context.pages[0]
+
+        logging.info(f"📌 Conectado à página: {page.url}")
+
+        print(f"\n👉 Certifique-se de estar na tela da turma no SIGEDUC e pressione ENTER no terminal...")
+        input()
+
+        # SELEÇÃO DO BIMESTRE VIA DROPDOWN
+        try:
+            logging.info(f"Alternando para o {bimestre}º Bimestre no dropdown...")
+            select_elem = page.wait_for_selector("#bimestreSelect", state="attached", timeout=5000)
+            if select_elem:
+                page.select_option("#bimestreSelect", str(bimestre), force=True)
+                page.evaluate("""
+                    const select = document.getElementById('bimestreSelect');
+                    if (select) {
+                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                """)
+                page.wait_for_timeout(1000)
+                logging.info(f"Filtro do {bimestre}º Bimestre aplicado.")
+        except Exception as e:
+            logging.warning(f"⚠️ Não foi possível alternar o #bimestreSelect: {e}")
+
+        # EXTRAÇÃO DOS ALUNOS DOS PAINÉIS RICHFACES (.rich-panel)
+        logging.info("🔍 Mapeando estrutura de alunos da página HTML...")
+        
+        paineis = page.query_selector_all(".rich-panel")
+        alunos_site = []
+
+        for idx, painel in enumerate(paineis):
+            header = painel.query_selector(".rich-panel-header")
+            if not header:
+                continue
+            
+            nome_texto = header.inner_text().strip()
+            if nome_texto:
+                id_aluno = painel.get_attribute("id") or str(idx)
+                alunos_site.append({
+                    "id_aluno": id_aluno,
+                    "nome_oficial": nome_texto,
+                    "seletor_indice": idx
+                })
+
+        logging.info(f"✅ {len(alunos_site)} alunos mapeados com sucesso na tela.")
+
+        if not alunos_site:
+            logging.error("⚠️ Nenhum aluno encontrado. Verifique se o diário de classe está aberto na tela.")
+            return
+
+        # EXTRAÇÃO DAS 3 NOTAS VIA GEMINI (MÚLTIPLAS IMAGENS)
+        resultado_mapeado = processar_cadernos_com_html(caminhos_imagens, alunos_site)
+
+        print("\n" + "="*50)
+        print(f"📊 NOTAS EXTRAÍDAS E MAPEADAS ({bimestre}º BIMESTRE - NOTAS 1, 2 E 3):")
+        print("="*50)
+        print(json.dumps(resultado_mapeado, indent=2, ensure_ascii=False))
+
+        confirmar = input(f"\n⚠️ Deseja preencher todas as 3 notas no {bimestre}º Bimestre? (s/n): ")
+        if confirmar.lower() != 's':
+            logging.info("Operação cancelada pelo usuário.")
+            return
+
+        # INSERÇÃO DAS NOTAS NO PORTAL
+        logging.info(f"⚡ Inserindo as 3 notas no portal para o {bimestre}º Bimestre...")
+        sucessos = 0
+        erros = 0
+
+        for item in resultado_mapeado.get("alunos", []):
+            id_aluno = item["id_aluno"]
+            nome_aluno = item["nome_oficial"]
+            
+            mapa_notas = {
+                "NT1": item.get("nota1"),
+                "NT2": item.get("nota2"),
+                "NT3": item.get("nota3")
+            }
+
+            aluno_info = next((a for a in alunos_site if a["id_aluno"] == id_aluno), None)
+            if not aluno_info:
+                logging.warning(f"⏩ Aluno {nome_aluno} não localizado no mapeamento da página.")
+                erros += 1
+                continue
+
+            idx = aluno_info["seletor_indice"]
+            painel_elem = paineis[idx]
+
+            inputs_bimestre = painel_elem.query_selector_all(f"input.n{bimestre}")
+
+            for i, (tipo_nt, val_nota) in enumerate(mapa_notas.items()):
+                if val_nota is None:
+                    continue
+                
+                nota_fmt = validar_e_formatar_nota(val_nota)
+                if not nota_fmt:
+                    continue
+
+                sufixo_avaliacao = f"{tipo_nt.lower()}n{bimestre}"
+
+                campo_nota = (
+                    painel_elem.query_selector(f"input[class*='{sufixo_avaliacao}']") or
+                    painel_elem.query_selector(f"input[id*='{sufixo_avaliacao}']")
+                )
+
+                if not campo_nota and len(inputs_bimestre) > i:
+                    campo_nota = inputs_bimestre[i]
+
+                if campo_nota:
+                    campo_nota.fill(nota_fmt)
+                    campo_nota.dispatch_event("change")
+                    campo_nota.dispatch_event("blur")
+                    logging.info(f"  -> {tipo_nt} [{nota_fmt}] inserida para: {nome_aluno}")
+                    sucessos += 1
+                else:
+                    logging.error(f"  ❌ Campo para {tipo_nt} não localizado para o aluno {nome_aluno}")
+                    erros += 1
+
+        logging.info(f"\n🎉 Processo concluído! Lançamentos bem-sucedidos: {sucessos} | Falhas/Avisos: {erros}")
+
+
+# ----------------------------------------------------------------------
+# 6. PONTO DE ENTRADA DO SCRIPT
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    
+    print("="*60)
+    print(" LANCE-NOTAS SIGEDUC / EDUC21 (MÚLTIPLAS IMAGENS)")
+    print("="*60)
+
+    # 1. Captura uma ou mais imagens via linha de comando ou terminal
+    if len(sys.argv) > 1:
+        caminhos_fotos = sys.argv[1:]
+    else:
+        entrada = input("📷 Digite os caminhos das imagens separados por espaço (ex: foto1.jpeg foto2.jpeg): ").strip()
+        caminhos_fotos = entrada.split()
+
+    # Valida a existência dos arquivos
+    fotos_validas = [f for f in caminhos_fotos if os.path.exists(f)]
+
+    if not fotos_validas:
+        print("❌ Nenhuma imagem válida encontrada nos caminhos informados.")
+        sys.exit(1)
+
+    # 2. Bimestre
+    bimestre_input = input("📅 Digite o Bimestre desejado (1, 2, 3 ou 4) [Padrão: 3]: ").strip()
+    bimestre_num = int(bimestre_input) if bimestre_input.isdigit() else 3
+
+    executar_em_aba_ativa(fotos_validas, bimestre=bimestre_num)

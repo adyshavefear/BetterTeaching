@@ -1,0 +1,6 @@
+# Only reviewed source and project setup files may be published.
+/*
+!/.gitignore
+!/script_notas.py
+!/requirements.txt
+!/README.md
