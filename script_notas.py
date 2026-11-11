@@ -138,7 +138,7 @@ def processar_cadernos_com_html(caminhos_imagens: List[str], alunos_site: list) 
                 logging.info(f"⏳ Servidor ocupado ou cota excedida. Aguardando {tempo_espera}s...")
                 time.sleep(tempo_espera)
             else:
-                raise RuntimeError(f"❌ Não foi possível obter resposta do Gemini após {max_tentativas} tentativas. Erro: {e}")
+                raise RuntimeError(f"❌ Não foi possível obter resposta do Gemini após {tentativa} tentativa(s). Erro: {e}")
 
 # ----------------------------------------------------------------------
 # 5. EXECUÇÃO DA AUTOMAÇÃO NO PLAYWRIGHT
