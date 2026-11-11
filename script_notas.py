@@ -6,7 +6,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright
 
 # ----------------------------------------------------------------------
@@ -29,9 +29,9 @@ load_dotenv()
 class NotasTriplasMapeadas(BaseModel):
     id_aluno: str
     nome_oficial: str
-    nota1: Optional[float] = None
-    nota2: Optional[float] = None
-    nota3: Optional[float] = None
+    nota1: Optional[float] = Field(default=None, ge=0, le=10, allow_inf_nan=False)
+    nota2: Optional[float] = Field(default=None, ge=0, le=10, allow_inf_nan=False)
+    nota3: Optional[float] = Field(default=None, ge=0, le=10, allow_inf_nan=False)
 
 class ListaNotasMapeadas(BaseModel):
     turma: str
@@ -52,6 +52,37 @@ def validar_e_formatar_nota(valor: Optional[float]) -> Optional[str]:
     except (ValueError, TypeError):
         logging.error(f"⚠️ Valor de nota inválido: {valor}")
         return None
+
+def validar_mapeamento(resultado: dict, alunos_site: list) -> dict:
+    resultado = ListaNotasMapeadas.model_validate(resultado, strict=True).model_dump()
+    oficiais = {a["id_aluno"]: a["nome_oficial"] for a in alunos_site}
+    if len(oficiais) != len(alunos_site):
+        raise ValueError("IDs de alunos duplicados na página.")
+    vistos = set()
+    for aluno in resultado["alunos"]:
+        identificador = aluno["id_aluno"]
+        if identificador in vistos or oficiais.get(identificador) != aluno["nome_oficial"]:
+            raise ValueError("A resposta contém aluno desconhecido, duplicado ou com nome divergente.")
+        vistos.add(identificador)
+    return resultado
+
+
+def planejar_preenchimento(page, resultado: dict, alunos_site: list, bimestre: int):
+    resultado = validar_mapeamento(resultado, alunos_site)
+    plano = []
+    for aluno in resultado["alunos"]:
+        painel = page.locator(f'[id={json.dumps(aluno["id_aluno"])}]')
+        for numero in range(1, 4):
+            valor = aluno[f"nota{numero}"]
+            if valor is None:
+                continue
+            sufixo = f"nt{numero}n{bimestre}"
+            campo = painel.locator(f"input[class*='{sufixo}'], input[id*='{sufixo}']")
+            if campo.count() != 1:
+                raise ValueError(f"Campo da Nota {numero} ausente ou ambíguo; nenhum preenchimento iniciado.")
+            plano.append((campo, validar_e_formatar_nota(valor), aluno["nome_oficial"], numero))
+    return plano
+
 
 # ----------------------------------------------------------------------
 # 4. PROCESSAMENTO DE MÚLTIPLAS FOTOS VIA GEMINI
@@ -99,20 +130,22 @@ def processar_cadernos_com_html(caminhos_imagens: List[str], alunos_site: list) 
                     tools=[]
                 ),
             )
-            return json.loads(response.text)
+            return validar_mapeamento(json.loads(response.text), alunos_site)
         except Exception as e:
             logging.warning(f"⚠️ Tentativa {tentativa} com {modelo} falhou: {e}")
             if ("503" in str(e) or "429" in str(e)) and tentativa < max_tentativas:
                 tempo_espera = tentativa * 7
                 logging.info(f"⏳ Servidor ocupado ou cota excedida. Aguardando {tempo_espera}s...")
                 time.sleep(tempo_espera)
-            elif tentativa == max_tentativas:
+            else:
                 raise RuntimeError(f"❌ Não foi possível obter resposta do Gemini após {max_tentativas} tentativas. Erro: {e}")
 
 # ----------------------------------------------------------------------
 # 5. EXECUÇÃO DA AUTOMAÇÃO NO PLAYWRIGHT
 # ----------------------------------------------------------------------
 def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
+    if bimestre not in (1, 2, 3, 4):
+        raise ValueError("O bimestre deve estar entre 1 e 4.")
     with sync_playwright() as p:
         try:
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
@@ -142,9 +175,11 @@ def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
                     }
                 """)
                 page.wait_for_timeout(1000)
+                if page.locator("#bimestreSelect").input_value() != str(bimestre):
+                    raise ValueError("Bimestre selecionado não corresponde ao solicitado.")
                 logging.info(f"Filtro do {bimestre}º Bimestre aplicado.")
         except Exception as e:
-            logging.warning(f"⚠️ Não foi possível alternar o #bimestreSelect: {e}")
+            raise RuntimeError("Não foi possível confirmar o bimestre; preenchimento cancelado.") from e
 
         # EXTRAÇÃO DOS ALUNOS DOS PAINÉIS RICHFACES (.rich-panel)
         logging.info("🔍 Mapeando estrutura de alunos da página HTML...")
@@ -152,18 +187,19 @@ def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
         paineis = page.query_selector_all(".rich-panel")
         alunos_site = []
 
-        for idx, painel in enumerate(paineis):
+        for painel in paineis:
             header = painel.query_selector(".rich-panel-header")
             if not header:
                 continue
             
             nome_texto = header.inner_text().strip()
             if nome_texto:
-                id_aluno = painel.get_attribute("id") or str(idx)
+                id_aluno = painel.get_attribute("id")
+                if not id_aluno:
+                    raise ValueError("Painel de aluno sem ID estável; operação cancelada.")
                 alunos_site.append({
                     "id_aluno": id_aluno,
-                    "nome_oficial": nome_texto,
-                    "seletor_indice": idx
+                    "nome_oficial": nome_texto
                 })
 
         logging.info(f"✅ {len(alunos_site)} alunos mapeados com sucesso na tela.")
@@ -180,6 +216,8 @@ def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
         print("="*50)
         print(json.dumps(resultado_mapeado, indent=2, ensure_ascii=False))
 
+        plano = planejar_preenchimento(page, resultado_mapeado, alunos_site, bimestre)
+
         confirmar = input(f"\n⚠️ Deseja preencher todas as 3 notas no {bimestre}º Bimestre? (s/n): ")
         if confirmar.lower() != 's':
             logging.info("Operação cancelada pelo usuário.")
@@ -188,58 +226,14 @@ def executar_em_aba_ativa(caminhos_imagens: List[str], bimestre: int = 3):
         # INSERÇÃO DAS NOTAS NO PORTAL
         logging.info(f"⚡ Inserindo as 3 notas no portal para o {bimestre}º Bimestre...")
         sucessos = 0
-        erros = 0
+        for campo, nota_fmt, nome_aluno, numero in plano:
+            campo.fill(nota_fmt)
+            campo.dispatch_event("change")
+            campo.dispatch_event("blur")
+            logging.info(f"  -> NT{numero} [{nota_fmt}] inserida para: {nome_aluno}")
+            sucessos += 1
 
-        for item in resultado_mapeado.get("alunos", []):
-            id_aluno = item["id_aluno"]
-            nome_aluno = item["nome_oficial"]
-            
-            mapa_notas = {
-                "NT1": item.get("nota1"),
-                "NT2": item.get("nota2"),
-                "NT3": item.get("nota3")
-            }
-
-            aluno_info = next((a for a in alunos_site if a["id_aluno"] == id_aluno), None)
-            if not aluno_info:
-                logging.warning(f"⏩ Aluno {nome_aluno} não localizado no mapeamento da página.")
-                erros += 1
-                continue
-
-            idx = aluno_info["seletor_indice"]
-            painel_elem = paineis[idx]
-
-            inputs_bimestre = painel_elem.query_selector_all(f"input.n{bimestre}")
-
-            for i, (tipo_nt, val_nota) in enumerate(mapa_notas.items()):
-                if val_nota is None:
-                    continue
-                
-                nota_fmt = validar_e_formatar_nota(val_nota)
-                if not nota_fmt:
-                    continue
-
-                sufixo_avaliacao = f"{tipo_nt.lower()}n{bimestre}"
-
-                campo_nota = (
-                    painel_elem.query_selector(f"input[class*='{sufixo_avaliacao}']") or
-                    painel_elem.query_selector(f"input[id*='{sufixo_avaliacao}']")
-                )
-
-                if not campo_nota and len(inputs_bimestre) > i:
-                    campo_nota = inputs_bimestre[i]
-
-                if campo_nota:
-                    campo_nota.fill(nota_fmt)
-                    campo_nota.dispatch_event("change")
-                    campo_nota.dispatch_event("blur")
-                    logging.info(f"  -> {tipo_nt} [{nota_fmt}] inserida para: {nome_aluno}")
-                    sucessos += 1
-                else:
-                    logging.error(f"  ❌ Campo para {tipo_nt} não localizado para o aluno {nome_aluno}")
-                    erros += 1
-
-        logging.info(f"\n🎉 Processo concluído! Lançamentos bem-sucedidos: {sucessos} | Falhas/Avisos: {erros}")
+        logging.info(f"Processo concluído. Campos preenchidos: {sucessos}. Confira a gravação no portal.")
 
 
 # ----------------------------------------------------------------------

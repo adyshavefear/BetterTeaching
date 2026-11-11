@@ -28,6 +28,12 @@ Keep its debugging port restricted to the local computer.
 
 ## Data handling and limitations
 
+Run `python -m unittest -v` to check validation and field selection without
+calling Gemini or connecting to the school portal. The complete response and
+all target fields are checked before filling starts. Unknown or repeated student
+IDs, mismatched names, invalid grades and missing or ambiguous fields stop the
+operation. Field positions are never used to guess a grade column.
+
 - The script uploads the supplied images and sends student names and portal IDs
   to Google's Gemini API. Only run it with data you are authorized to process
   through that external service. Git exclusions do not prevent these uploads.
